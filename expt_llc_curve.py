@@ -1,3 +1,8 @@
+import gc
+from turtle import pd
+
+from torch import seed
+
 import jax
 import jax.numpy as jnp
 import jax.tree_util as jtree
@@ -11,6 +16,7 @@ from sgld_utils import (
     SGLDConfig,
     run_sgld
 )
+from utils import to_json_friendly_tree, running_mean
 import optax
 from sacred import Expriment
 # Create a new expriment
@@ -239,4 +245,98 @@ def run_expriment(
             return compute_loss(parameter,model_state,rngkey,x,y, is_training=False, l2_regularization=None)[0]
         
         
+    # Train the model and do SGLD at some interval
 
+    itemp = 1/ np.log(num_training_data)
+    max_steps = training_config.num_steps
+
+    _run.info = []
+    t = 0 
+
+    while t < max_steps:
+        x_batch, y_batch = next(train_dataset_iter)
+        rngkey, subkey = jax.random.split(rngkey)
+        train_loss, trained_param, model_state, opt_state = update_step(
+            trained_param,
+            model_state,
+            subkey,
+            x_batch,
+            y_batch,
+            opt_state
+        )
+        if t % logging_period == 0 or t == max_steps - 1:
+            gc.collect()
+            if force_realisable:
+                y= model.apply(trained_param, model_state, rngkey, x_train, False)[0]
+            else:
+                if using_label_noise:
+                    y = y_train_no_noise
+                else:
+                    y = y_train
+            
+            loss_fn = lambda params, state, rngkey, x, y: sgld_outer_loss_fn(params, state, rngkey, x,y)
+            loss_trace, distances,acceptance_probs = run_sgld(
+                subkey,
+                sgld_config,
+                loss_fn,
+                trained_param,
+                x_train,
+                y,
+                itemp=itemp,
+                trace_batch_loss=loss_trace_minibatch,
+                compute_distances=False,
+                compute_mala_acceptance_probs=False,
+                verbose=verbose
+            )
+            init_loss = loss_fn(trained_param, model_state,x_train, y)
+            lamddahat = float(np.mean(loss_trace)-init_loss)* num_training_data*itemp
+            print(f"Step {t}: Loss: {train_loss:.4f}, Lambda_hat: {lamddahat:.4f}")
+            test_loss = compute_loss(trained_param, model_state, rngkey,x_test, y_test, is_training=False, l2_regularization=training_config.l2_regularization)[0]
+            test_loss_no_reg = compute_loss(trained_param, model_state, rngkey,x_test, y_test, is_training=False, l2_regularization=None)[0]
+            print(f"Step {t}: Test Loss: {test_loss:.4f}, Test Loss (no reg): {test_loss_no_reg:.4f}")
+            rngkey, subkey = jax.random.split(rngkey)
+            train_acc = evaluate_accuracy(model, trained_param, model_state, x_train, y_train, subkey)
+            rngkey, subkey = jax.random.split(rngkey)
+            test_acc = evaluate_accuracy(model, trained_param, model_state, x_test, y_test, subkey)
+            rec = {
+                "t": t+1 ,
+                "train_loss": float(train_loss),
+                "test_loss": float(test_loss),
+                "test_loss_no_reg": float(test_loss_no_reg),
+                "train_acc": float(train_acc),
+                "test_acc": float(test_acc),
+                "lambda_hat": float(lamddahat),
+                "loss_trace": loss_trace,
+                "init_loss": float(init_loss),
+                "slgld_distances": distances,
+                "sgld_acceptance_probs": acceptance_probs,
+            }
+            if verbose:
+                print(f"Step {t}: Train Loss: {train_loss:.4f}, Test Loss: {test_loss:.4f}, Test Loss (no reg): {test_loss_no_reg:.4f}, Train Acc: {train_acc:.4f}, Test Acc: {test_acc:.4f}, Lambda_hat: {lamddahat:.4f}")
+
+            _run.info.append(to_json_friendly_tree(rec))
+        t += 1
+        if t >= max_steps:
+            break   
+    if do_plot:
+        df = pd.DataFrame(_run.info)
+        fig, ax = plt.subplots()
+        ax.plot(df['t'], df['train_loss'], label='Train Loss')
+        ax.set_xlabel('Training Steps')
+        ax.set_ylabel('Loss')
+
+        ax = ax.twinx()
+        title = (
+            f"$T={training_config.num_steps}$, " 
+            f"$k={logging_period}$, "
+            f"RNG seed$={seed}$"
+        )
+        ax.plot(df["t"], np.clip(df["lambdahat"], a_min=0, a_max=np.inf), "kx", alpha=0.3)
+        yvals = running_mean(df["lambdahat"])
+        ax.plot(df["t"], yvals, "g-")
+        ax.set_ylabel("Estimated LLC, $\hat{\lambda}(w^*)$")
+        ax.set_title(title, fontsize="large")
+        filepath = f"llc_curve_plot_{expt_name}_{seed}.pdf"
+        fig.savefig(filepath, bbox_inches="tight")
+        print(f"Image saved at: {filepath}")
+    return
