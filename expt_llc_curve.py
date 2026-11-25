@@ -1,7 +1,5 @@
 import gc
-from turtle import pd
 
-from torch import seed
 
 import jax
 import jax.numpy as jnp
@@ -18,10 +16,9 @@ from sgld_utils import (
 )
 from utils import to_json_friendly_tree, running_mean
 import optax
-from sacred import Expriment
-
+from sacred import Experiment
 # Create a new expriment
-ex= Expriment('llc_curve')
+ex= Experiment('llc_curve')
 
 class TrainingConfig(NamedTuple):
     optim: str 
@@ -136,7 +133,7 @@ def cfg():
         "label_noise_level": None,
         "layer_width_factor": 64,
     }
-    Training_config = {
+    training_config = {
         "optim": "sgd",
         "learning_rate": 1e-3,
         "momentum": None,
@@ -198,12 +195,12 @@ def run_expriment(
     rngkey, subkey = jax.random.split(rngkey)
     num_training_data = x_train.shape[0]
 
-    if training_config.otim.lower() == "sgd":
+    if training_config.optim.lower() == "sgd":
         optimizer = optax.adam(
             learning_rate= training_config.learning_rate,
             momentum=training_config.momentum
         )
-    elif training_config.otim.lower() == "adam":
+    elif training_config.optim.lower() == "adam":
             optimizer = optax.adam(
             learning_rate= training_config.learning_rate,)
     else:
@@ -211,7 +208,7 @@ def run_expriment(
     opt_state= optimizer.init(trained_param)
 
     def compute_loss(params, state, rngkey, x,y, is_training, l2_regularization=0.0):
-        labels_one_hot = jax.nn.one(y,10)
+        labels_one_hot = jax.nn.one_hot(y,10)
         logits, new_state = model.apply(params, state, rngkey, x, is_training)
         loss_val = jnp.mean(optax.softmax_cross_entropy(logits, labels=labels_one_hot))
         if l2_regularization is not None and l2_regularization > 0.0:
