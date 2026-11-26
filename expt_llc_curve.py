@@ -4,7 +4,8 @@ import gc
 import jax
 import jax.numpy as jnp
 import jax.tree_util as jtree
-import matplotlib as plt 
+import matplotlib.pyplot as plt
+import pandas as pd
 import numpy as np 
 import tensorflow as tf 
 import tensorflow_datasets as tfds
@@ -38,7 +39,7 @@ class CustomResNet18(hk.nets.ResNet):
             strides: Sequence[str] = (1,2,2,2),
     ):
         custom_configs = {
-            "blocks_per_groups": (2,2,2,2),
+            "blocks_per_group": (2,2,2,2),
             "bottleneck": False,
             "channels_per_group": (k,2 * k, 4 * k, 8 *k),
             "use_projection": (False, True, True,True),
@@ -54,7 +55,7 @@ class CustomResNet18(hk.nets.ResNet):
 def make_resnet18(num_classes=10, k=64):
     def net_fn(x, is_training=True):
         model = CustomResNet18(num_classes=num_classes,k=k)
-        return model
+        return model(x, is_training)
     return hk.transform_with_state(net_fn)
 
 def introduce_label_noise(labels, noise_level):
@@ -75,7 +76,7 @@ def load_cifar10(noise_level=None):
     train_ds = tfds.as_numpy(ds_builder.as_dataset(split='train', batch_size=-1, shuffle_files=False))
     test_ds = tfds.as_numpy(ds_builder.as_dataset(split='test', batch_size=-1))
     train_images, train_labels = train_ds['image'], train_ds['label']
-    test_images, test_labels = test_ds['images'], test_ds['label']   
+    test_images, test_labels = test_ds['image'], test_ds['label']   
 
     train_images = train_images.astype(jnp.float32) / 255.0
     test_images = test_images.astype(jnp.float32) / 255.0 
@@ -91,7 +92,7 @@ def load_cifar10(noise_level=None):
           datasets['noisy_train_labels'] =  introduce_label_noise(train_labels, noise_level)
     return datasets
 
-def initialize_model(rng, num_classes=10, k=64):
+def initialize_model(rng, num_classes=10, k=8):
     model = make_resnet18(num_classes=num_classes, k=k)
     dummy_input = jnp.ones([1,32,32,3], jnp.float32)
     params, state= model.init(rng,dummy_input, True)
@@ -124,22 +125,22 @@ def cfg():
         'gamma': 1.0,
         'num_steps': 1000,
         "num_chains": 1,
-        "batch_size": 1024
+        "batch_size": 1024,
     }
     loss_trace_minibatch = True
     model_data_config = {
         "model_name": "resnet18",
         "data_name": "cifar10",
         "label_noise_level": None,
-        "layer_width_factor": 64,
+        "layer_width_factor": 12,
     }
     training_config = {
-        "optim": "sgd",
+        "optim": "adam",
         "learning_rate": 1e-3,
-        "momentum": None,
+        "momentum": 0.9,
         "batch_size": 128,
-        "num_steps": 20000,
-        "l2_regularization":None,
+        "num_steps": 1000,
+        "l2_regularization": None,
     }
     force_realisable = False 
     seed = 42
@@ -169,7 +170,8 @@ def run_expriment(
     training_config= TrainingConfig(**training_config)
     label_noise_level = model_data_config['label_noise_level']
     dataset = load_cifar10(noise_level=label_noise_level)
-    x_train, x_test, y_test= dataset['train_images'], dataset['train_labels'], dataset['test_labels']
+    x_train, x_test = dataset['train_images'], dataset['test_images']
+    y_train, y_test = dataset['train_labels'], dataset['test_labels']
     using_label_noise = label_noise_level is not None and label_noise_level > 0.0 
     if using_label_noise:
         y_train = dataset['noisy_train_labels'] 
@@ -196,7 +198,7 @@ def run_expriment(
     num_training_data = x_train.shape[0]
 
     if training_config.optim.lower() == "sgd":
-        optimizer = optax.adam(
+        optimizer = optax.sgd(
             learning_rate= training_config.learning_rate,
             momentum=training_config.momentum
         )
@@ -216,7 +218,7 @@ def run_expriment(
             loss_val += l2_loss
         return loss_val, new_state
 
-    training_loss_fn = lambda parameter, state, rengkey, x, y:compute_loss(
+    training_loss_fn = lambda parameter, state, rngkey, x, y:compute_loss(
         parameter,
         state,
         rngkey,
@@ -272,21 +274,22 @@ def run_expriment(
                 else:
                     y = y_train
             
-            loss_fn = lambda params, state, rngkey, x, y: sgld_outer_loss_fn(params, state, rngkey, x,y)
+            # run_sgld expects loss_fn(params, x, y), so bind model_state and rngkey here
+            loss_fn = lambda params, x, y: sgld_outer_loss_fn(params, model_state, subkey, x, y)
             loss_trace, distances,acceptance_probs = run_sgld(
                 subkey,
-                sgld_config,
                 loss_fn,
+                sgld_config,
                 trained_param,
                 x_train,
                 y,
                 itemp=itemp,
                 trace_batch_loss=loss_trace_minibatch,
-                compute_distances=False,
-                compute_mala_acceptance_probs=False,
+                compute_distance=False,
+                compute_mala_acceptance=False,
                 verbose=verbose
             )
-            init_loss = loss_fn(trained_param, model_state,x_train, y)
+            init_loss = loss_fn(trained_param, x_train, y)
             lamddahat = float(np.mean(loss_trace)-init_loss)* num_training_data*itemp
             print(f"Step {t}: Loss: {train_loss:.4f}, Lambda_hat: {lamddahat:.4f}")
             test_loss = compute_loss(trained_param, model_state, rngkey,x_test, y_test, is_training=False, l2_regularization=training_config.l2_regularization)[0]
@@ -329,8 +332,8 @@ def run_expriment(
             f"$k={logging_period}$, "
             f"RNG seed$={seed}$"
         )
-        ax.plot(df["t"], np.clip(df["lambdahat"], a_min=0, a_max=np.inf), "kx", alpha=0.3)
-        yvals = running_mean(df["lambdahat"])
+        ax.plot(df["t"], np.clip(df["lambda_hat"], a_min=0, a_max=np.inf), "kx", alpha=0.3)
+        yvals = running_mean(df["lambda_hat"])
         ax.plot(df["t"], yvals, "g-")
         ax.set_ylabel("Estimated LLC, $\hat{\lambda}(w^*)$")
         ax.set_title(title, fontsize="large")
